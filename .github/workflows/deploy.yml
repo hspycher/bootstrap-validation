@@ -1,0 +1,94 @@
+name: Deploy to AWS (S3 + CloudFront)
+
+# Production deploy on push to main (released code), preview deploy on push
+# to dev (working integration branch). Runs its own test+build rather than
+# trusting the branch, since dev accepts direct pushes (not just PRs).
+#
+# Needs these repo Variables set (Settings -> Secrets and variables ->
+# Actions -> Variables) once AWS infra exists -- see
+# references/aws-infra-setup.md:
+#   S3_BUCKET_PROD, S3_BUCKET_PREVIEW, CLOUDFRONT_DIST_PROD,
+#   CLOUDFRONT_DIST_PREVIEW, CLOUDFRONT_URL_PROD, CLOUDFRONT_URL_PREVIEW,
+#   AWS_ROLE_ARN, AWS_REGION
+# And this Secret: DISCORD_WEBHOOK_URL (optional -- skips notify if unset).
+
+on:
+  push:
+    branches: [main, dev]
+
+permissions:
+  id-token: write   # required for OIDC -> AWS role assumption
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      - name: Pick environment for this branch
+        id: env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            {
+              echo "bucket=${{ vars.S3_BUCKET_PROD }}"
+              echo "distribution=${{ vars.CLOUDFRONT_DIST_PROD }}"
+              echo "label=production"
+              echo "url=${{ vars.CLOUDFRONT_URL_PROD }}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "bucket=${{ vars.S3_BUCKET_PREVIEW }}"
+              echo "distribution=${{ vars.CLOUDFRONT_DIST_PREVIEW }}"
+              echo "label=preview"
+              echo "url=${{ vars.CLOUDFRONT_URL_PREVIEW }}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Sync build to S3
+        run: |
+          aws s3 sync dist/ "s3://${{ steps.env.outputs.bucket }}" --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.env.outputs.distribution }}" \
+            --paths "/*"
+
+      - name: Notify Discord
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            exit 0
+          fi
+          GAME_URL="${{ steps.env.outputs.url }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ job.status }}" = "success" ]; then
+            TITLE="Deployed to ${{ steps.env.outputs.label }}"
+            COLOR=3066993
+            DESC="Branch **${{ github.ref_name }}**\n[Play it here](${GAME_URL})"
+          else
+            TITLE="Deploy to ${{ steps.env.outputs.label }} failed"
+            COLOR=15158332
+            DESC="Branch **${{ github.ref_name }}**\n(last successful deploy, if any, is still live: ${GAME_URL})"
+          fi
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"embeds\":[{\"title\":\"${TITLE}\",\"url\":\"${RUN_URL}\",\"color\":${COLOR},\"description\":\"${DESC}\"}]}" \
+            "$DISCORD_WEBHOOK_URL"

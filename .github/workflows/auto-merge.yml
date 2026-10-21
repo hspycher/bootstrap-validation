@@ -1,0 +1,111 @@
+name: Auto-merge on green CI
+
+# Two independent triggers feed the same merge attempt, because dev requires
+# TWO status checks (CI + ai-review) and they can land in either order: CI
+# finishing first is the common case (workflow_run), but the ai-review cron
+# job can finish after CI already tried and failed with a "not all checks
+# have passed yet" 405 -- the `status` trigger re-attempts the merge
+# whenever ai-review posts, so that ordering doesn't require a human to
+# notice and re-run anything.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  status: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: >
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'status' && github.event.context == 'ai-review' && github.event.state == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find and merge the open PR for this branch (dev target only)
+        env:
+          # Personal token, NOT secrets.GITHUB_TOKEN -- a merge performed with
+          # GITHUB_TOKEN doesn't trigger downstream push-triggered workflows
+          # (GitHub's loop prevention), which would silently stop deploy.yml
+          # (push-only trigger) from ever firing after an auto-merge. This
+          # token is ALSO the only thing in the whole pipeline with actual
+          # merge authority -- it lives in GitHub's secret store, not on any
+          # local machine, and is deliberately kept separate from the
+          # narrowly-scoped token the ai-review cron job uses (that one can
+          # only comment + post statuses, never merge, even if it leaked).
+          GH_TOKEN: ${{ secrets.PERSONAL_GH_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          STATUS_SHA: ${{ github.event.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            HEAD_BRANCH="$WORKFLOW_RUN_BRANCH"
+          else
+            # status event has no branch name directly -- resolve it from the SHA
+            HEAD_BRANCH=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/commits/${STATUS_SHA}/branches-where-head" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['name'] if d else '')")
+          fi
+
+          # Never auto-merge CI runs against main/dev themselves (nothing to
+          # merge), only runs that happened on a feature branch with an open PR.
+          if [ "$HEAD_BRANCH" = "main" ] || [ "$HEAD_BRANCH" = "dev" ] || [ -z "$HEAD_BRANCH" ]; then
+            echo "Nothing to merge for branch '${HEAD_BRANCH}'."
+            exit 0
+          fi
+
+          PR_JSON=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/pulls?head=${OWNER}:${HEAD_BRANCH}&state=open")
+          PR_NUMBER=$(echo "$PR_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')")
+          PR_BASE=$(echo "$PR_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['base']['ref'] if d else '')")
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for branch ${HEAD_BRANCH}; nothing to merge."
+            exit 0
+          fi
+
+          # Auto-merge ONLY targets dev. A PR aimed at main (a dev->main
+          # promotion) must be merged by a human, never automatically.
+          if [ "$PR_BASE" != "dev" ]; then
+            echo "PR #${PR_NUMBER} targets '${PR_BASE}', not 'dev' -- skipping auto-merge (requires manual merge)."
+            exit 0
+          fi
+
+          echo "Attempting to merge PR #${PR_NUMBER} into dev (triggered by: ${EVENT_NAME})"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/merge" \
+            -d '{"merge_method":"squash"}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "$BODY"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Merged."
+            exit 0
+          fi
+
+          if [ "$HTTP_CODE" = "405" ]; then
+            # Expected/quiet case: the other required status check (CI or
+            # ai-review) hasn't landed yet. Whichever trigger fires second
+            # will retry this successfully -- not a real failure.
+            echo "Not mergeable yet (waiting on the other required status check) -- will retry when it lands."
+            exit 0
+          fi
+
+          echo "Merge failed with HTTP $HTTP_CODE"
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
+            ERR_MSG=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('message','unknown error'))" 2>/dev/null || echo "unknown error")
+            curl -s -X POST -H "Content-Type: application/json" \
+              -d "{\"embeds\":[{\"title\":\"Auto-merge failed for PR #${PR_NUMBER}\",\"url\":\"${PR_URL}\",\"color\":16776960,\"description\":\"CI passed but the merge itself failed (HTTP ${HTTP_CODE}): ${ERR_MSG}\"}]}" \
+              "$DISCORD_WEBHOOK_URL"
+          fi
+          exit 1

@@ -1,0 +1,85 @@
+name: Update changelog on main promotion
+
+# Generates/replaces a CHANGELOG.md entry for every dev -> main promotion PR,
+# committing it onto the PR's own head branch (not main directly - main is
+# protected). A human still reviews and merges the PR normally; this just
+# makes sure the changelog entry rides along as part of that merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      # Personal token, not secrets.GITHUB_TOKEN -- so this push re-triggers
+      # CI normally (GitHub's loop-prevention skips GITHUB_TOKEN pushes).
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.PERSONAL_GH_TOKEN }}
+
+      - name: Loop guard -- skip if HEAD is already our own changelog commit
+        id: guard
+        run: |
+          AUTHOR_EMAIL=$(git log -1 --pretty=%ae)
+          if [ "$AUTHOR_EMAIL" = "changelog-bot@users.noreply.github.com" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replace or add this PR's changelog entry (idempotent)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          # Untrusted input (PR title is attacker-controlled) must come in
+          # via env, never interpolated directly into the script body --
+          # a title like `"; rm -rf . #` would otherwise execute as shell.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git fetch origin main
+          DATE=$(date -u +%Y-%m-%d)
+          PR_NUM="${{ github.event.pull_request.number }}"
+          ENTRIES=$(git log origin/main..HEAD --no-merges --pretty=format:'- %s (%h)')
+
+          if [ -z "$ENTRIES" ]; then
+            echo "No new commits vs main; nothing to log."
+            exit 0
+          fi
+
+          touch CHANGELOG.md
+          awk -v pr="PR #${PR_NUM}:" '
+            /^# Changelog$/ { next }
+            $0 ~ "^## .* " pr { skip=1; next }
+            /^## / { skip=0 }
+            !skip { print }
+          ' CHANGELOG.md > /tmp/changelog_rest
+
+          {
+            echo "# Changelog"
+            echo ""
+            echo "## ${DATE} -- PR #${PR_NUM}: ${PR_TITLE}"
+            echo ""
+            echo "$ENTRIES"
+            echo ""
+            cat /tmp/changelog_rest
+          } > /tmp/changelog_new
+          mv /tmp/changelog_new CHANGELOG.md
+
+          git config user.name "changelog-bot"
+          git config user.email "changelog-bot@users.noreply.github.com"
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changelog changes to commit."
+          else
+            git commit -m "docs: update CHANGELOG.md for PR #${PR_NUM}"
+            git push origin "HEAD:${HEAD_REF}"
+          fi

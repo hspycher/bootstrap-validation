@@ -1,0 +1,38 @@
+name: Lint workflows
+
+# Safety net: a prior project had the literal string '***' hardcoded in 3
+# Authorization headers instead of a real $GH_TOKEN reference. Every
+# automated merge silently failed with 401 for an unknown period -- nothing
+# ever tested the workflow files themselves, only application code had CI
+# coverage. This closes that gap: generic syntax checks + the exact bug class.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches: [dev, main]
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint (generic syntax/shellcheck-class checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  no-fake-auth-tokens:
+    name: Regression guard -- no literal/fake auth tokens
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail on literal placeholder tokens in auth headers
+        run: python3 .github/scripts/check_workflow_auth.py
